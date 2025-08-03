@@ -16,8 +16,56 @@ DB_TYPE="ORACLE"
 GPG_PASSWORD_FILE="/path/to/your/password.gpg" # Path to GPG encrypted password file
 DMS_TEMPLATE_FILE="./update_password_template.dms" # Path to the DMS template file
 
+# SQL statement for the initial, direct update.
+# The placeholder %%NEW_PASSWORD%% will be replaced by the script.
+DIRECT_SQL_UPDATE="UPDATE PSACCESSPROFILE SET ACCESSPSWD = '%%NEW_PASSWORD%%' WHERE ACCESSID = 'SYSADM';"
+
 # Hardcoded Database User ID
 DM_USER="FINPRD"
+
+
+# --- Function Definitions ---
+
+run_direct_sql_update() {
+    local new_pass="$1"
+    local sql_statement
+
+    echo "--------------------------------------------------"
+    echo "Step 1: Performing direct database update via sqlplus..."
+
+    # Substitute the new password into the SQL statement
+    sql_statement=$(echo "$DIRECT_SQL_UPDATE" | sed "s|%%NEW_PASSWORD%%|${new_pass}|g")
+
+    # Execute sqlplus, piping the commands to it securely.
+    # The '|| echo' trick ensures the variable captures output even on failure.
+    local output
+    output=$(sqlplus -S -L "${DM_USER}/${DM_PASSWORD}@${DB_NAME}" <<EOF
+WHENEVER SQLERROR EXIT 1;
+WHENEVER OSERROR EXIT 1;
+SET FEEDBACK OFF;
+SET HEADING OFF;
+${sql_statement}
+COMMIT;
+EXIT;
+EOF
+    ) || echo "SQLPLUS_ERROR"
+
+    # Check for Oracle errors in the output
+    if echo "$output" | grep -q -E 'ORA-|SP2-'; then
+        echo "Error: Direct SQL update failed. Oracle error detected." >&2
+        echo "--- SQLPLUS OUTPUT ---" >&2
+        echo "$output" >&2
+        echo "----------------------" >&2
+        return 1
+    elif [[ "$output" == "SQLPLUS_ERROR" ]]; then
+        echo "Error: sqlplus command failed to execute." >&2
+        return 1
+    fi
+
+    echo "Direct database update appears to be successful."
+    return 0
+}
+
 
 echo "PeopleSoft Password Change Automation Script"
 echo "------------------------------------------"
@@ -29,9 +77,14 @@ echo
 # The password will be decrypted from a GPG file. The User ID is hardcoded.
 echo "Using Database User ID: ${DM_USER}"
 
-# --- Decrypt DB Password from GPG File ---
+# --- Prerequisite Checks ---
 if ! command -v gpg &> /dev/null; then
     echo "Error: gpg command not found. Please install GnuPG." >&2
+    exit 1
+fi
+
+if ! command -v sqlplus &> /dev/null; then
+    echo "Error: sqlplus command not found. Please ensure Oracle Client is installed and in your PATH." >&2
     exit 1
 fi
 
@@ -69,10 +122,20 @@ if [ "$NEW_PASSWORD" != "$NEW_PASSWORD_CONFIRM" ]; then
     exit 1
 fi
 
-echo "Input validation successful. Preparing to run Data Mover..."
+echo "Input validation successful."
 echo
 
-# --- Create a temporary Data Mover Script ---
+# --- Step 1: Direct SQL Update ---
+run_direct_sql_update "$NEW_PASSWORD"
+if [ $? -ne 0 ]; then
+    echo "Aborting script due to failure in direct SQL update step." >&2
+    exit 1
+fi
+echo
+
+# --- Step 2: Create a temporary Data Mover Script for final encryption ---
+echo "--------------------------------------------------"
+echo "Step 2: Preparing Data Mover script for final encryption..."
 # Using mktemp to create a secure temporary file
 DMS_FILE=$(mktemp /tmp/change_password.XXXXXX.dms)
 if [ ! -f "$DMS_FILE" ]; then
